@@ -1,0 +1,69 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so the nvcc-build
+# job in ci.yml only compiles. This builds build/test_gpu and runs it on a
+# simulated NVIDIA H100 (https://github.com/pantheongpu/pantheonsim), so every
+# kernel is checked against its CPU reference on a device. A simulator cannot
+# reproduce hardware-specific behavior or timing, so it complements real-GPU
+# testing and does not replace it.
+#
+# A wrong-architecture run can print a VirtualGPU error and still exit 0, so the
+# job also checks the output for device errors, the "0 failures" summary and the
+# simulator's kernel launch counters.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "kernels/**"
+      - "include/**"
+      - "tests/**"
+      - "Makefile"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (CUDA 13.0 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # compute_90 embeds PTX only, which the simulator runs, and the simulator
+      # needs a shared CUDA runtime. The benchmark links cuBLAS and is not built.
+      - name: Build
+        run: make build/test_gpu NVCC=/usr/local/cuda-13.0/bin/nvcc ARCH="compute_90 -cudart shared"
+
+      - name: Run the tests
+        run: |
+          vgpu run --counters ./build/test_gpu > test.log 2>&1 || { tail -n 100 test.log; exit 1; }
+          # the counter blocks are indented by four spaces; keep the test's own output
+          grep -vE "^\[vgpu\]\[counters\]|^    " test.log > test-output.log
+          cat test-output.log
+          if grep -nE "FAIL" test-output.log || grep -niE "VirtualGPU error|CUDA error|no device|no CUDA-capable|skip" test.log; then
+            echo "::error::the run reported a device problem, a skip or a failure"; exit 1
+          fi
+          grep -qE "^59 checks, 0 failures$" test.log
+          for t in vector_add reduce softmax matmul; do grep -qE "^$t +ok$" test.log; done
+          launches=$(grep -c "\[vgpu\]\[counters\]" test.log)
+          grep "\[vgpu\]\[counters\]" test.log | head -n 3
+          echo "kernel launch counter lines recorded by the simulator: $launches"
+          # vector_add 5, reduce 30 (two passes), softmax 24, matmul 15
+          test "$launches" -eq 74
